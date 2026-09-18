@@ -1,6 +1,9 @@
 """功能开关判定引擎。
 
 判定顺序：
+0. 所选配置版本若带版本化生效窗口（[active_from, active_until) 半开区间），
+   先按当前 UTC 时刻判断：窗口外直接返回 inactive_variant_key，
+   decision_path="inactive"，跳过 override、规则与分桶。
 1. 未指定 config_version 时，先查该 flag+user 是否存在“未过期且变体仍存在于
    当前配置”的临时强制变体（override）：命中则跳过规则与分桶，直接返回该变体，
    decision_path="override"。到期或变体已移除的记录不生效，继续正常判定。
@@ -14,6 +17,7 @@
 
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 # 桶空间固定为 100，与“权重总和必须为 100”对应
@@ -43,6 +47,51 @@ class Override:
     variant_key: str
     reason: str
     expires_at: Any = None  # naive UTC datetime 或 None（不过期）
+
+
+@dataclass(frozen=True)
+class ActivationWindow:
+    """版本化生效窗口：半开区间 [active_from, active_until)。
+
+    两个边界均为 naive UTC（持久层从 SQLite 读出的形态），至少一个非空；
+    窗口外判定返回 inactive_variant_key。
+    """
+
+    active_from: datetime | None
+    active_until: datetime | None
+    inactive_variant_key: str
+
+
+def _naive_utc(dt: datetime) -> datetime:
+    """aware / naive datetime 统一为 naive UTC，便于与库内边界比较。"""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def window_status(
+    window: ActivationWindow, now: datetime | None = None
+) -> tuple[bool, str]:
+    """判断当前时刻是否在窗口内，返回 (是否在窗口内, 边界说明)。
+
+    区间为 ``[active_from, active_until)``：起点含、终点不含。
+    """
+    now = _naive_utc(now) if now is not None else datetime.now(timezone.utc).replace(tzinfo=None)
+    if window.active_from is not None and now < window.active_from:
+        return False, (
+            f"当前时刻 {now.isoformat()}Z 早于窗口起点 "
+            f"{window.active_from.isoformat()}Z，窗口尚未生效"
+        )
+    if window.active_until is not None and now >= window.active_until:
+        return False, (
+            f"当前时刻 {now.isoformat()}Z 已到达/越过窗口终点 "
+            f"{window.active_until.isoformat()}Z（终点不含），窗口已失效"
+        )
+    return True, (
+        f"当前时刻 {now.isoformat()}Z 位于生效窗口 "
+        f"[{window.active_from.isoformat() + 'Z' if window.active_from is not None else '-∞'}, "
+        f"{window.active_until.isoformat() + 'Z' if window.active_until is not None else '+∞'}) 内"
+    )
 
 
 class RuleEvaluationError(ValueError):
@@ -125,7 +174,7 @@ def pick_variant_by_weight(variants: list[Variant], bucket: int) -> tuple[str, t
 @dataclass
 class Decision:
     variant_key: str
-    decision_path: str  # "rule" | "bucket" | "override"
+    decision_path: str  # "rule" | "bucket" | "override" | "inactive"
     bucket_value: int | None
     matched_rule: Rule | None
     matched_rule_index: int | None  # 排序后从 0 开始
@@ -163,6 +212,44 @@ def override_decision(ov: Override) -> Decision:
     return Decision(
         variant_key=ov.variant_key,
         decision_path="override",
+        bucket_value=None,
+        matched_rule=None,
+        matched_rule_index=None,
+        explanation=explanation,
+    )
+
+
+def inactive_decision(window: ActivationWindow, reason: str) -> Decision:
+    """窗口外：跳过 override、规则与分桶，直接返回兜底变体与解释链。"""
+    explanation = [
+        {
+            "step": "activation_window_loaded",
+            "detail": {
+                "active_from": (
+                    window.active_from.isoformat() + "Z"
+                    if window.active_from is not None
+                    else None
+                ),
+                "active_until": (
+                    window.active_until.isoformat() + "Z"
+                    if window.active_until is not None
+                    else None
+                ),
+                "inactive_variant_key": window.inactive_variant_key,
+            },
+        },
+        {
+            "step": "inactive_selected",
+            "detail": {
+                "variant_key": window.inactive_variant_key,
+                "reason": reason,
+                "selection_reason": "当前时刻不在生效窗口内，跳过 override、规则判定与哈希分桶",
+            },
+        },
+    ]
+    return Decision(
+        variant_key=window.inactive_variant_key,
+        decision_path="inactive",
         bucket_value=None,
         matched_rule=None,
         matched_rule_index=None,

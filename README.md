@@ -10,6 +10,7 @@
 - 规则所需属性**缺失（或值为 `null`）一律视为未命中**，继续判定下一条；
 - 同一用户在配置不变时判定结果**稳定**（哈希输入只有 `flag_key:user_id`）；
 - 每次创建 / 更新在**同一事务**中保存一份**不可变配置版本**，历史版本可查询、可指定用于判定；
+- 支持可选的**版本化生效窗口**（`activation_window`）：窗口为半开区间 `[active_from, active_until)`，窗口外跳过 override、规则与分桶，直接返回兜底变体；窗口随当前配置与每个历史版本保存；
 - 支持**按用户的临时强制变体（override）**：未指定 `config_version` 时优先于规则与分桶，可带过期时间，到期 / 变体被移除后自动失效；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
 - 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**。
@@ -68,7 +69,7 @@ curl -sS -X DELETE http://localhost:8000/api/v1/flags/new_checkout/overrides/use
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/flags` | 创建 / 更新开关（已存在则 `version + 1`，同事务保存不可变版本） |
+| `POST` | `/api/v1/flags` | 创建 / 更新开关（已存在则 `version + 1`，同事务保存不可变版本；可选 `activation_window` 生效窗口随版本固化） |
 | `GET` | `/api/v1/flags` | 列出全部开关 |
 | `GET` | `/api/v1/flags/{flag_key}` | 查看单个开关 |
 | `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关（版本历史与 override 一并删除） |
@@ -108,7 +109,52 @@ curl -sS -X POST http://localhost:8000/api/v1/flags \
 
 - 变体权重之和必须恰好为 `100`，权重允许为 `0`（该变体永不被分桶选中）；变体 key 不可重复；
 - 规则 `priority` 不可重复（数字越小越先判定）；
-- 规则的 `variant_key` 必须是已配置的变体。
+- 规则的 `variant_key` 必须是已配置的变体；
+- 提供 `activation_window` 时，`inactive_variant_key` 必须是已配置的变体。
+
+### 版本化生效窗口（activation_window）
+
+创建 / 更新开关时可携带可选的 `activation_window`，把开关限制在半开时间区间 `[active_from, active_until)` 内生效：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/flags \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "flag_key": "btn_color",
+    "variants": [
+      {"key": "red",  "weight": 20},
+      {"key": "blue", "weight": 80}
+    ],
+    "rules": [
+      {"priority": 1, "attribute": "region", "operator": "eq", "values": ["cn"], "variant_key": "red"}
+    ],
+    "activation_window": {
+      "active_from": "2026-09-20T08:00:00Z",
+      "active_until": "2026-09-30T08:00:00Z",
+      "inactive_variant_key": "blue"
+    }
+  }'
+```
+
+字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `active_from` | 可选，窗口起点（**含**），ISO 8601 **必须带时区**（如 `...Z` 或 `+08:00`），服务统一转为 UTC |
+| `active_until` | 可选，窗口终点（**不含**），格式要求同 `active_from` |
+| `inactive_variant_key` | **必填**，窗口外返回的兜底变体；必须是本次配置中已存在的变体，否则 `422` |
+
+校验与语义（不满足均返回 `422`）：
+
+- 两个时间边界**至少设置一个**（只设起点 = 起点之后永久生效；只设终点 = 终点之前生效）；
+- 时间必须带时区，服务统一转存 UTC；双边界都给时 `active_from` 必须**严格早于** `active_until`（相等也拒绝）；
+- 边界可以是过去或未来，不做“必须晚于当前”的限制（窗口可用于回溯判定与排期发布）；
+- 更新开关时省略 `activation_window` 视为**移除窗口**（与规则 / 变体一样整体覆盖）；
+- **窗口随当前配置和每个不可变历史版本一起保存**：判定时采用**所选配置版本**（`config_version` 缺省为当前版本）的窗口。钉住某个历史版本就按该版本固化的窗口与边界判定；升级前创建的老版本无窗口，视为永久生效，语义不变；
+- 判定发生在窗口**外**时（`now < active_from`，或 `now >= active_until`）：**跳过 override、规则与分桶**，直接返回兜底变体，响应 `decision_path="inactive"`、`matched_rule=null`、`bucket_value=null`，解释链为 `activation_window_loaded` → `inactive_selected`，后者的 `reason` 说明越过了哪条边界；
+- 判定发生在窗口**内**时，解释链与结果与无窗口完全一致（override → 规则 → 分桶），不追加额外步骤；
+- 窗口判定结果随快照固化：**相同 `request_id` 的重试直接重放已存快照，不会按当前时间重新计算**（窗口随时间翻转为生效 / 失效也不影响重放）；
+- 发布前影响预览（preview-impact）只比较规则与分桶，不应用窗口。
 
 ### 配置版本（不可变历史）
 
@@ -131,11 +177,12 @@ curl -sS http://localhost:8000/api/v1/flags/btn_color/versions/1
   "description": "按钮颜色实验",
   "variants": [{"key": "red", "weight": 20, "description": ""}, {"key": "blue", "weight": 80, "description": ""}],
   "rules": [{"priority": 1, "attribute": "region", "operator": "eq", "values": ["cn"], "variant_key": "red"}],
+  "activation_window": {"active_from": "2026-09-20T08:00:00Z", "active_until": "2026-09-30T08:00:00Z", "inactive_variant_key": "blue"},
   "created_at": "2026-09-17T08:00:00Z"
 }
 ```
 
-判定时可通过可选字段 `config_version` 钉住某个历史版本：使用该版本的**规则与权重**计算，并把该版本号写入判定快照；缺省使用最新版；版本不存在返回 `404`。
+判定时可通过可选字段 `config_version` 钉住某个历史版本：使用该版本的**规则、权重与生效窗口**计算，并把该版本号写入判定快照；缺省使用最新版；版本不存在返回 `404`。升级前保存的历史版本没有窗口，按无窗口（始终走 override / 规则 / 分桶）处理。
 
 ```bash
 # 用 v1 的规则与权重判定（即使当前已发布到 v3）
@@ -166,7 +213,7 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/rollback \
 
 行为约定：
 
-- 成功返回 `201`，响应体与创建 / 更新接口的 `FlagResponse` 结构一致，`version` 为新版本号，配置内容（`description` / `variants` / `rules`）与 `target_version` 完全相同；
+- 成功返回 `201`，响应体与创建 / 更新接口的 `FlagResponse` 结构一致，`version` 为新版本号，配置内容（`description` / `variants` / `rules` / `activation_window`）与 `target_version` 完全相同；
 - 仅当开关存在**且**实际当前版本等于 `expected_current_version` 时才写入；期望版本过期（已被其他发布推进）返回 **`409 Conflict` 且不改动任何数据**（版本历史也不追加），调用方重新读取当前版本后可重试；
 - 开关不存在返回 `404`；开关存在但 `target_version` 历史版本不存在同样返回 `404`；
 - 字段缺失或版本号小于 `1` 返回 `422`；
@@ -265,11 +312,12 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/evaluate \
 - `decision_path = "rule"` 时 `matched_rule` 为命中规则、`bucket_value` 为 `null`；
 - `decision_path = "bucket"` 时 `matched_rule` 为 `null`，`bucket_value` 为 `0-99`；
 - `decision_path = "override"` 时（按用户临时强制变体命中）`matched_rule` 与 `bucket_value` 均为 `null`，解释链只含 `override_loaded` 与 `override_selected` 两步；
+- `decision_path = "inactive"` 时（所选版本的生效窗口外）`matched_rule` 与 `bucket_value` 均为 `null`，解释链只含 `activation_window_loaded` 与 `inactive_selected` 两步，后者的 `reason` 给出边界说明（尚未生效 / 已失效）；
 - 配置更新会使 `config_version` 自增；**同一版本配置下，同一 `flag_key + user_id` 永远落入同一桶**。
 
 ### 幂等
 
-判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context、`config_version` 不同，或首次生效的 override 事后被修改、到期、删除），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
+判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context、`config_version` 不同，或首次生效的 override 事后被修改、到期、删除，或生效窗口随时间从窗口内翻转到窗口外 / 反之），**不按当前时间重算**，适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
 
 ### 发布前影响预览（只读）
 
@@ -393,9 +441,9 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
 │   ├── cursor.py      # 审计列表的不透明签名游标（边界 + 过滤绑定 + 高水位）
 │   ├── crud.py        # 配置、版本、override 与快照持久化（含分页查询与索引补齐）
-│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / flag_overrides / decision_snapshots）
+│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / flag_overrides / decision_snapshots，配置与版本行各带生效窗口三列）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（93 项，含 override 用例）
+├── tests/             # pytest：引擎单测 + API 集成测试（127 项，含 override 与生效窗口用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -412,5 +460,6 @@ python -m pytest -q
 
 - 服务定位为**本地 / 单机**使用：SQLite + 单实例，未做多副本一致性；
 - 判定快照只增不删（删除开关不影响历史快照回查）；配置版本与按用户 override 随开关一并删除；
-- 快照保存判定时的 `config_version` 与 `decision_path`（含 override 的变体与原因）；幂等重放重建 `matched_rule` 详情时优先取该版本的历史配置，版本记录缺失（如开关被删除重建）时回退到当前版本配置；
-- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`，此后每次更新正常追加。
+- 快照保存判定时的 `config_version` 与 `decision_path`（含 override 与窗口兜底）；幂等重放重建 `matched_rule` 详情时优先取该版本的历史配置，版本记录缺失（如开关被删除重建）时回退到当前版本配置；
+- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`，此后每次更新正常追加；
+- 升级到含生效窗口的版本时，老库启动会幂等地给 `flag_configs` / `flag_config_versions` 补 `active_from` / `active_until` / `inactive_variant_key` 三个可空列：列已存在则跳过，可重复执行；老数据三列为空，按**无窗口**参与判定。

@@ -1,7 +1,7 @@
 """FastAPI 入口：功能开关判定服务。
 
 路由：
-- POST /api/v1/flags              创建/更新开关配置（已存在则 version+1，同事务保存不可变版本）
+- POST /api/v1/flags              创建/更新开关配置（已存在则 version+1，同事务保存不可变版本，含生效窗口）
 - GET  /api/v1/flags              列出全部开关
 - GET  /api/v1/flags/{flag_key}   查看单个开关
 - DELETE /api/v1/flags/{flag_key} 删除开关（版本历史一并删除）
@@ -56,8 +56,9 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     db = next(get_db())
     try:
+        # 老库 create_all 不会追加新列 / 新索引，显式幂等补齐（须先补列再回填版本）
+        crud.ensure_activation_window_columns(db)
         crud.backfill_missing_versions(db)
-        # 老库 create_all 不会追加新列 / 新索引，显式幂等补齐
         crud.ensure_snapshot_decision_path(db)
         crud.ensure_decision_audit_indexes(db)
     finally:
@@ -341,6 +342,7 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
 
     # 解析本次判定使用的配置版本：缺省用最新版，指定时必须存在
     if req.config_version is None:
+        config_row = flag
         rules_json, variants_json = flag.rules_json, flag.variants_json
         config_version = flag.version
     else:
@@ -350,16 +352,33 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"开关 {flag_key!r} 没有版本 {req.config_version}",
             )
+        config_row = ver
         rules_json, variants_json = ver.rules_json, ver.variants_json
         config_version = ver.version
 
     rules = crud.parse_rules(rules_json)
     variants = crud.parse_variants(variants_json)
 
+    # 所选配置版本的生效窗口（[active_from, active_until)）：窗口外直接返回兜底
+    # 变体，跳过 override、规则与分桶。老数据无窗口，保持原语义。
+    decision = None
+    window = crud.get_window(
+        config_row.active_from, config_row.active_until, config_row.inactive_variant_key
+    )
+    if window is not None:
+        in_window, window_reason = eng.window_status(window)
+        if not in_window:
+            if window.inactive_variant_key not in {v.key for v in variants}:
+                # 正常不可达：创建 / 更新时已校验兜底变体存在；保留防御避免返回未知变体
+                raise RuleEvaluationError(
+                    f"生效窗口的兜底变体 {window.inactive_variant_key!r} 不存在于"
+                    f"配置版本 {config_version} 的变体中"
+                )
+            decision = eng.inactive_decision(window, window_reason)
+
     # 仅在未钉住历史版本时允许临时强制变体：未过期且变体仍存在于当前配置才生效；
     # 到期或变体已移除的记录不参与，继续走规则与分桶。
-    decision = None
-    if req.config_version is None:
+    if decision is None and req.config_version is None:
         active_override = crud.get_active_override(
             db, flag_key, req.user_id, {v.key for v in variants}
         )

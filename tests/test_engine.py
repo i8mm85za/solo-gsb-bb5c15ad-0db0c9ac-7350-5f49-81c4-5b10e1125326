@@ -1,15 +1,20 @@
-"""判定引擎单元测试：分桶、规则、解释链。"""
+"""判定引擎单元测试：分桶、规则、解释链、生效窗口。"""
+
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.engine import (
+    ActivationWindow,
     Rule,
     RuleEvaluationError,
     Variant,
     decide,
     evaluate_rule,
+    inactive_decision,
     pick_variant_by_weight,
     stable_bucket,
+    window_status,
 )
 
 VARIANTS = [Variant("on", 10), Variant("off", 90)]
@@ -99,3 +104,73 @@ def test_zero_weight_variant_never_bucketed():
     vs = [Variant("a", 0), Variant("b", 100)]
     for b in range(100):
         assert pick_variant_by_weight(vs, b)[0] == "b"
+
+
+# ---------------------------------------------------------------------------
+# 版本化生效窗口（半开区间 [active_from, active_until)）
+# ---------------------------------------------------------------------------
+
+_FROM = datetime(2026, 9, 20, 8, 0, 0)
+_UNTIL = datetime(2026, 9, 22, 8, 0, 0)
+_WIN = ActivationWindow(_FROM, _UNTIL, "off")
+
+
+def test_window_active_between_bounds():
+    inside, reason = window_status(_WIN, datetime(2026, 9, 21, 8, 0, 0))
+    assert inside is True
+    assert "位于生效窗口" in reason
+
+
+def test_window_active_from_is_inclusive():
+    inside, _ = window_status(_WIN, _FROM)
+    assert inside is True
+
+
+def test_window_active_until_is_exclusive():
+    inside, reason = window_status(_WIN, _UNTIL)
+    assert inside is False
+    assert "已失效" in reason
+
+
+def test_window_before_start_is_inactive():
+    inside, reason = window_status(_WIN, datetime(2026, 9, 20, 7, 59, 59))
+    assert inside is False
+    assert "尚未生效" in reason
+
+
+def test_window_after_end_is_inactive():
+    inside, _ = window_status(_WIN, datetime(2026, 9, 23))
+    assert inside is False
+
+
+def test_window_only_from():
+    win = ActivationWindow(_FROM, None, "off")
+    assert window_status(win, datetime(2026, 9, 21))[0] is True
+    assert window_status(win, datetime(2026, 9, 1))[0] is False
+
+
+def test_window_only_until():
+    win = ActivationWindow(None, _UNTIL, "off")
+    assert window_status(win, datetime(2026, 9, 21))[0] is True
+    assert window_status(win, _UNTIL)[0] is False
+
+
+def test_window_status_normalizes_aware_datetime_to_utc():
+    # +08:00 的 2026-09-20T16:00:00 == UTC 08:00:00 == active_from（含）
+    aware_from = datetime(2026, 9, 20, 16, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    assert window_status(_WIN, aware_from)[0] is True
+
+
+def test_inactive_decision_shape():
+    d = inactive_decision(_WIN, "窗口尚未生效")
+    assert d.decision_path == "inactive"
+    assert d.variant_key == "off"
+    assert d.bucket_value is None
+    assert d.matched_rule is None
+    assert d.matched_rule_index is None
+    steps = [e["step"] for e in d.explanation]
+    assert steps == ["activation_window_loaded", "inactive_selected"]
+    loaded = d.explanation[0]["detail"]
+    assert loaded["active_from"] == "2026-09-20T08:00:00Z"
+    assert loaded["active_until"] == "2026-09-22T08:00:00Z"
+    assert loaded["inactive_variant_key"] == "off"

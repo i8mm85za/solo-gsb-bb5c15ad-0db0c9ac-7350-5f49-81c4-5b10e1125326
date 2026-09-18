@@ -65,9 +65,66 @@ class FlagConfigBody(BaseModel):
         return self
 
 
+class ActivationWindowIn(BaseModel):
+    """开关的版本化生效窗口。
+
+    窗口为半开区间 ``[active_from, active_until)``：至少给出一个边界，
+    时间必须带时区（服务统一转 UTC）；两个边界都给时 active_from 必须
+    严格早于 active_until。窗口外判定直接返回 inactive_variant_key。
+    """
+
+    active_from: datetime | None = Field(
+        default=None, description="可选窗口起点（含），ISO 8601 带时区，服务统一转 UTC"
+    )
+    active_until: datetime | None = Field(
+        default=None, description="可选窗口终点（不含），ISO 8601 带时区，服务统一转 UTC"
+    )
+    inactive_variant_key: str = Field(
+        min_length=1, max_length=128, description="必填，窗口外返回的兜底变体 key"
+    )
+
+    @field_validator("active_from", "active_until")
+    @classmethod
+    def _must_be_aware_and_normalize_utc(cls, v: datetime | None) -> datetime | None:
+        if v is None:
+            return None
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("生效窗口边界必须是带时区的时间，例如 2026-09-20T08:00:00Z 或 2026-09-20T16:00:00+08:00")
+        return v.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "ActivationWindowIn":
+        if self.active_from is None and self.active_until is None:
+            raise ValueError("activation_window 至少设置 active_from / active_until 中的一个时间边界")
+        if (
+            self.active_from is not None
+            and self.active_until is not None
+            and not self.active_from < self.active_until
+        ):
+            raise ValueError(
+                "activation_window 的 active_from 必须严格早于 active_until（窗口区间为 [active_from, active_until)）"
+            )
+        return self
+
+
 class FlagUpsertRequest(FlagConfigBody):
     flag_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
     description: str = ""
+    activation_window: ActivationWindowIn | None = Field(
+        default=None,
+        description="可选版本化生效窗口；随当前配置与每个不可变版本保存，省略表示无窗口",
+    )
+
+    @model_validator(mode="after")
+    def _inactive_variant_must_exist(self) -> "FlagUpsertRequest":
+        if self.activation_window is not None:
+            variant_keys = {v.key for v in self.variants}
+            key = self.activation_window.inactive_variant_key
+            if key not in variant_keys:
+                raise ValueError(
+                    f"activation_window.inactive_variant_key 引用了不存在的变体 {key!r}"
+                )
+        return self
 
 
 class FlagResponse(BaseModel):
@@ -76,6 +133,7 @@ class FlagResponse(BaseModel):
     version: int
     variants: list[VariantIn]
     rules: list[RuleIn]
+    activation_window: ActivationWindowIn | None
     created_at: Any
     updated_at: Any
 
@@ -88,6 +146,7 @@ class FlagVersionResponse(BaseModel):
     description: str
     variants: list[VariantIn]
     rules: list[RuleIn]
+    activation_window: ActivationWindowIn | None
     created_at: Any
 
 
@@ -169,7 +228,7 @@ class EvaluateResponse(BaseModel):
     )
     bucket_value: int | None = Field(description="0-99 的稳定哈希分桶值；规则命中时为 null")
     variant_key: str
-    decision_path: Literal["rule", "bucket", "override"]
+    decision_path: Literal["rule", "bucket", "override", "inactive"]
     explanation: list[ExplanationStep]
 
 
@@ -182,7 +241,7 @@ class SnapshotResponse(BaseModel):
     bucket_value: int | None
     matched_rule_index: int | None
     variant_key: str
-    decision_path: Literal["rule", "bucket", "override"]
+    decision_path: Literal["rule", "bucket", "override", "inactive"]
     explanation: list[ExplanationStep]
     decided_at: Any
 

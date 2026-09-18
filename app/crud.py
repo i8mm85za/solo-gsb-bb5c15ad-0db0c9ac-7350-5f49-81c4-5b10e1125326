@@ -32,16 +32,64 @@ def parse_variants(raw: str) -> list[eng.Variant]:
     return [eng.Variant(**item) for item in json.loads(raw or "[]")]
 
 
-def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
-    """创建开关；已存在时版本号 +1 并整体覆盖规则/变体。
+def _aware_utc(dt: datetime | None) -> datetime | None:
+    """库内 naive UTC 补回 tzinfo；aware 时间统一转 UTC。None 透传。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
-    同一事务中向 flag_config_versions 追加一份完整不可变快照。
+
+def get_window(
+    active_from: datetime | None,
+    active_until: datetime | None,
+    inactive_variant_key: str | None,
+) -> eng.ActivationWindow | None:
+    """由 ORM 行的三个窗口列构造 ActivationWindow；老数据三列皆空 -> None。"""
+    if inactive_variant_key is None:
+        return None
+    return eng.ActivationWindow(
+        active_from=active_from,
+        active_until=active_until,
+        inactive_variant_key=inactive_variant_key,
+    )
+
+
+def window_to_response(row) -> dict | None:
+    """序列化为 ActivationWindowIn 形态；无窗口返回 None。"""
+    if row.inactive_variant_key is None:
+        return None
+    return {
+        "active_from": _aware_utc(row.active_from),
+        "active_until": _aware_utc(row.active_until),
+        "inactive_variant_key": row.inactive_variant_key,
+    }
+
+
+def _window_storage(payload: FlagUpsertRequest) -> tuple[datetime | None, datetime | None, str | None]:
+    """提取 upsert 请求中的窗口列（边界统一存 naive UTC）；无窗口返回 (None, None, None)。"""
+    win = payload.activation_window
+    if win is None:
+        return None, None, None
+
+    def _naive(dt: datetime | None) -> datetime | None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt is not None else None
+
+    return _naive(win.active_from), _naive(win.active_until), win.inactive_variant_key
+
+
+def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
+    """创建开关；已存在时版本号 +1 并整体覆盖规则/变体/生效窗口。
+
+    同一事务中向 flag_config_versions 追加一份完整不可变快照（含窗口）。
     """
     rules_json = json.dumps(
         [r.model_dump() for r in sorted(payload.rules, key=lambda x: x.priority)],
         ensure_ascii=False,
     )
     variants_json = json.dumps([v.model_dump() for v in payload.variants], ensure_ascii=False)
+    active_from, active_until, inactive_variant_key = _window_storage(payload)
 
     flag = db.scalar(select(FlagConfig).where(FlagConfig.flag_key == payload.flag_key))
     if flag is None:
@@ -51,12 +99,18 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
             rules_json=rules_json,
             variants_json=variants_json,
             version=1,
+            active_from=active_from,
+            active_until=active_until,
+            inactive_variant_key=inactive_variant_key,
         )
         db.add(flag)
     else:
         flag.description = payload.description
         flag.rules_json = rules_json
         flag.variants_json = variants_json
+        flag.active_from = active_from
+        flag.active_until = active_until
+        flag.inactive_variant_key = inactive_variant_key
         flag.version += 1
     db.add(
         FlagConfigVersion(
@@ -65,6 +119,9 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
             description=payload.description,
             rules_json=rules_json,
             variants_json=variants_json,
+            active_from=active_from,
+            active_until=active_until,
+            inactive_variant_key=inactive_variant_key,
         )
     )
     db.commit()
@@ -102,6 +159,9 @@ def rollback_flag(
     flag.description = target.description
     flag.rules_json = target.rules_json
     flag.variants_json = target.variants_json
+    flag.active_from = target.active_from
+    flag.active_until = target.active_until
+    flag.inactive_variant_key = target.inactive_variant_key
     flag.version += 1
     db.add(
         FlagConfigVersion(
@@ -110,6 +170,9 @@ def rollback_flag(
             description=target.description,
             rules_json=target.rules_json,
             variants_json=target.variants_json,
+            active_from=target.active_from,
+            active_until=target.active_until,
+            inactive_variant_key=target.inactive_variant_key,
         )
     )
     db.commit()
@@ -262,6 +325,10 @@ def backfill_missing_versions(db: Session) -> int:
                     description=flag.description,
                     rules_json=flag.rules_json,
                     variants_json=flag.variants_json,
+                    # 老库的当前配置同样无窗口（列为 NULL），补齐的版本记录无窗口
+                    active_from=flag.active_from,
+                    active_until=flag.active_until,
+                    inactive_variant_key=flag.inactive_variant_key,
                     created_at=flag.updated_at,
                 )
             )
@@ -280,6 +347,7 @@ def flag_to_response(flag: FlagConfig) -> dict:
         "version": flag.version,
         "variants": variants,
         "rules": rules,
+        "activation_window": window_to_response(flag),
         "created_at": flag.created_at,
         "updated_at": flag.updated_at,
     }
@@ -294,6 +362,7 @@ def version_to_response(ver: FlagConfigVersion) -> dict:
         "description": ver.description,
         "variants": variants,
         "rules": rules,
+        "activation_window": window_to_response(ver),
         "created_at": ver.created_at,
     }
 
@@ -337,6 +406,27 @@ def count_snapshots(db: Session) -> int:
 def max_snapshot_id(db: Session) -> int | None:
     """返回当前最大自增 id（首页发起时的高水位）；空表返回 None。"""
     return db.scalar(select(func.max(DecisionSnapshot.id)))
+
+
+def ensure_activation_window_columns(db: Session) -> None:
+    """为老库幂等补齐版本化生效窗口的三个可空列。
+
+    ``Base.metadata.create_all`` 只建新表、不会向老表追加列：
+    分别检查 flag_configs / flag_config_versions 缺哪些列就 ALTER TABLE
+    补哪些（SQLite 与 PostgreSQL 均支持 ADD COLUMN）。可空列无需回填，
+    老数据三列皆为 NULL，按“无窗口”语义参与判定。
+    """
+    ddl = {
+        "active_from": "ALTER TABLE {table} ADD COLUMN active_from DATETIME",
+        "active_until": "ALTER TABLE {table} ADD COLUMN active_until DATETIME",
+        "inactive_variant_key": "ALTER TABLE {table} ADD COLUMN inactive_variant_key VARCHAR(128)",
+    }
+    for table in ("flag_configs", "flag_config_versions"):
+        existing = {c["name"] for c in inspect(db.bind).get_columns(table)}
+        for column, stmt in ddl.items():
+            if column not in existing:
+                db.execute(text(stmt.format(table=table)))
+    db.commit()
 
 
 def ensure_snapshot_decision_path(db: Session) -> None:

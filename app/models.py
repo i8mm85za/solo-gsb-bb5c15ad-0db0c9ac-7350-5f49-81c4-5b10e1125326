@@ -25,6 +25,11 @@ class FlagConfig(Base):
     # [{ "key": "red", "weight": 50, "description": "" }]
     variants_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # 版本化生效窗口（[active_from, active_until) 半开区间，存 naive UTC）：
+    # inactive_variant_key 非空即表示该版本带窗口；老数据三列均为 NULL，视为无窗口。
+    active_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    active_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    inactive_variant_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -49,6 +54,10 @@ class FlagConfigVersion(Base):
     description: Mapped[str] = mapped_column(String(512), default="")
     rules_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     variants_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # 随版本固化的生效窗口（与 flag_configs 同构）；老版本行为 NULL，视为无窗口。
+    active_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    active_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    inactive_variant_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -108,7 +117,7 @@ class DecisionSnapshot(Base):
     bucket_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
     matched_rule_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    # 判定路径：rule / bucket / override。老数据由 ensure_snapshot_decision_path
+    # 判定路径：rule / bucket / override / inactive。老数据由 ensure_snapshot_decision_path
     # 按 matched_rule_index 是否为空回填。
     decision_path: Mapped[str | None] = mapped_column(String(16), nullable=True)
     explanation_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
