@@ -9,7 +9,13 @@ from sqlalchemy.orm import Session
 
 from app import engine as eng
 from app.models import DecisionSnapshot, FlagConfig, FlagConfigVersion, FlagOverride
-from app.schemas import FlagUpsertRequest, OverrideUpsertRequest, RuleIn, VariantIn
+from app.schemas import (
+    ActivationWindowIn,
+    FlagUpsertRequest,
+    OverrideUpsertRequest,
+    RuleIn,
+    VariantIn,
+)
 
 
 class NotFound(Exception):
@@ -32,6 +38,48 @@ def parse_variants(raw: str) -> list[eng.Variant]:
     return [eng.Variant(**item) for item in json.loads(raw or "[]")]
 
 
+def serialize_activation_window(window: ActivationWindowIn | None) -> str | None:
+    """把生效窗口序列化为 JSON 文本（时间已在校验层转为 UTC）；无窗口返回 None。"""
+    if window is None:
+        return None
+    return json.dumps(
+        {
+            "active_from": window.active_from.isoformat() if window.active_from else None,
+            "active_until": window.active_until.isoformat() if window.active_until else None,
+            "inactive_variant_key": window.inactive_variant_key,
+        },
+        ensure_ascii=False,
+    )
+
+
+def parse_activation_window(raw: str | None) -> eng.ActivationWindow | None:
+    """从 JSON 文本还原生效窗口；NULL / 空串（老数据）一律视为无窗口。"""
+    if not raw:
+        return None
+    item = json.loads(raw)
+    return eng.ActivationWindow(
+        inactive_variant_key=item["inactive_variant_key"],
+        active_from=(
+            datetime.fromisoformat(item["active_from"]) if item.get("active_from") else None
+        ),
+        active_until=(
+            datetime.fromisoformat(item["active_until"]) if item.get("active_until") else None
+        ),
+    )
+
+
+def _activation_window_to_response(raw: str | None) -> dict | None:
+    """把库存 JSON 还原为响应结构（带时区的 UTC 时间，序列化输出带 Z）。"""
+    window = parse_activation_window(raw)
+    if window is None:
+        return None
+    return {
+        "active_from": window.active_from,
+        "active_until": window.active_until,
+        "inactive_variant_key": window.inactive_variant_key,
+    }
+
+
 def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
     """创建开关；已存在时版本号 +1 并整体覆盖规则/变体。
 
@@ -42,6 +90,8 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
         ensure_ascii=False,
     )
     variants_json = json.dumps([v.model_dump() for v in payload.variants], ensure_ascii=False)
+    # 整体覆盖语义：未提供 activation_window 即清除已有窗口
+    window_json = serialize_activation_window(payload.activation_window)
 
     flag = db.scalar(select(FlagConfig).where(FlagConfig.flag_key == payload.flag_key))
     if flag is None:
@@ -50,6 +100,7 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
             description=payload.description,
             rules_json=rules_json,
             variants_json=variants_json,
+            activation_window_json=window_json,
             version=1,
         )
         db.add(flag)
@@ -57,6 +108,7 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
         flag.description = payload.description
         flag.rules_json = rules_json
         flag.variants_json = variants_json
+        flag.activation_window_json = window_json
         flag.version += 1
     db.add(
         FlagConfigVersion(
@@ -65,6 +117,7 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
             description=payload.description,
             rules_json=rules_json,
             variants_json=variants_json,
+            activation_window_json=window_json,
         )
     )
     db.commit()
@@ -102,6 +155,7 @@ def rollback_flag(
     flag.description = target.description
     flag.rules_json = target.rules_json
     flag.variants_json = target.variants_json
+    flag.activation_window_json = target.activation_window_json
     flag.version += 1
     db.add(
         FlagConfigVersion(
@@ -110,6 +164,7 @@ def rollback_flag(
             description=target.description,
             rules_json=target.rules_json,
             variants_json=target.variants_json,
+            activation_window_json=target.activation_window_json,
         )
     )
     db.commit()
@@ -262,6 +317,7 @@ def backfill_missing_versions(db: Session) -> int:
                     description=flag.description,
                     rules_json=flag.rules_json,
                     variants_json=flag.variants_json,
+                    activation_window_json=flag.activation_window_json,
                     created_at=flag.updated_at,
                 )
             )
@@ -280,6 +336,7 @@ def flag_to_response(flag: FlagConfig) -> dict:
         "version": flag.version,
         "variants": variants,
         "rules": rules,
+        "activation_window": _activation_window_to_response(flag.activation_window_json),
         "created_at": flag.created_at,
         "updated_at": flag.updated_at,
     }
@@ -294,6 +351,7 @@ def version_to_response(ver: FlagConfigVersion) -> dict:
         "description": ver.description,
         "variants": variants,
         "rules": rules,
+        "activation_window": _activation_window_to_response(ver.activation_window_json),
         "created_at": ver.created_at,
     }
 
@@ -358,6 +416,21 @@ def ensure_snapshot_decision_path(db: Session) -> None:
             "WHERE decision_path IS NULL"
         )
     )
+    db.commit()
+
+
+def ensure_activation_window_columns(db: Session) -> None:
+    """为老库幂等补齐 activation_window_json 列（flag_configs / flag_config_versions）。
+
+    ``Base.metadata.create_all`` 只建新表、不会向老表追加列：缺列时
+    ALTER TABLE 增加可空列；老数据一律为 NULL，判定视为无生效窗口。
+    重复执行为空操作。
+    """
+    for table in ("flag_configs", "flag_config_versions"):
+        columns = {c["name"] for c in inspect(db.bind).get_columns(table)}
+        if "activation_window_json" in columns:
+            continue
+        db.execute(text(f"ALTER TABLE {table} ADD COLUMN activation_window_json TEXT"))
     db.commit()
 
 

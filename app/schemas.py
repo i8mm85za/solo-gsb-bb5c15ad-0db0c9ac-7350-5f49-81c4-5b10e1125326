@@ -33,6 +33,45 @@ class VariantIn(BaseModel):
     description: str = ""
 
 
+class ActivationWindowIn(BaseModel):
+    """版本化生效窗口：判定按 ``[active_from, active_until)`` 生效。
+
+    至少提供 ``active_from`` / ``active_until`` 之一；时间必须带时区，
+    服务统一转为 UTC 存储；两个边界同时提供时前者必须早于后者。
+    """
+
+    active_from: datetime | None = Field(
+        default=None, description="生效起点（含），ISO 8601 且带时区，统一转 UTC"
+    )
+    active_until: datetime | None = Field(
+        default=None, description="生效终点（不含），ISO 8601 且带时区，统一转 UTC"
+    )
+    inactive_variant_key: str = Field(
+        min_length=1, max_length=128, description="窗口外返回的兜底变体 key"
+    )
+
+    @field_validator("active_from", "active_until")
+    @classmethod
+    def _must_be_tz_aware_utc(cls, v: datetime | None) -> datetime | None:
+        if v is None:
+            return None
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("时间必须带时区，例如 2026-09-20T08:00:00Z")
+        return v.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _window_consistent(self) -> "ActivationWindowIn":
+        if self.active_from is None and self.active_until is None:
+            raise ValueError("activation_window 至少需要 active_from 或 active_until 之一")
+        if (
+            self.active_from is not None
+            and self.active_until is not None
+            and self.active_from >= self.active_until
+        ):
+            raise ValueError("active_from 必须早于 active_until")
+        return self
+
+
 class FlagConfigBody(BaseModel):
     """开关配置体（variants + rules 及配套校验）。
 
@@ -41,6 +80,10 @@ class FlagConfigBody(BaseModel):
 
     variants: list[VariantIn] = Field(min_length=2, description="至少配置两个加权变体")
     rules: list[RuleIn] = Field(default_factory=list)
+    activation_window: ActivationWindowIn | None = Field(
+        default=None,
+        description="可选生效窗口；缺省（null）表示不设置，窗口随配置版本一同保存",
+    )
 
     @field_validator("variants")
     @classmethod
@@ -62,6 +105,14 @@ class FlagConfigBody(BaseModel):
         for r in self.rules:
             if r.variant_key not in variant_keys:
                 raise ValueError(f"规则(priority={r.priority})引用了不存在的变体 {r.variant_key!r}")
+        if (
+            self.activation_window is not None
+            and self.activation_window.inactive_variant_key not in variant_keys
+        ):
+            raise ValueError(
+                f"activation_window 的兜底变体 "
+                f"{self.activation_window.inactive_variant_key!r} 不存在于 variants 中"
+            )
         return self
 
 
@@ -76,6 +127,9 @@ class FlagResponse(BaseModel):
     version: int
     variants: list[VariantIn]
     rules: list[RuleIn]
+    activation_window: ActivationWindowIn | None = Field(
+        description="当前配置的生效窗口；null 表示无窗口"
+    )
     created_at: Any
     updated_at: Any
 
@@ -88,6 +142,9 @@ class FlagVersionResponse(BaseModel):
     description: str
     variants: list[VariantIn]
     rules: list[RuleIn]
+    activation_window: ActivationWindowIn | None = Field(
+        description="该版本保存时的生效窗口；null 表示无窗口（老数据一律为 null）"
+    )
     created_at: Any
 
 
@@ -169,7 +226,7 @@ class EvaluateResponse(BaseModel):
     )
     bucket_value: int | None = Field(description="0-99 的稳定哈希分桶值；规则命中时为 null")
     variant_key: str
-    decision_path: Literal["rule", "bucket", "override"]
+    decision_path: Literal["rule", "bucket", "override", "inactive"]
     explanation: list[ExplanationStep]
 
 
@@ -182,7 +239,7 @@ class SnapshotResponse(BaseModel):
     bucket_value: int | None
     matched_rule_index: int | None
     variant_key: str
-    decision_path: Literal["rule", "bucket", "override"]
+    decision_path: Literal["rule", "bucket", "override", "inactive"]
     explanation: list[ExplanationStep]
     decided_at: Any
 
@@ -229,7 +286,7 @@ class PreviewOutcome(BaseModel):
     """单个配置下的判定结果（只读判定，无快照与解释链）。"""
 
     variant_key: str
-    decision_path: Literal["rule", "bucket"]
+    decision_path: Literal["rule", "bucket", "inactive"]
     matched_rule_index: int | None = Field(
         description="排序后命中的规则下标（从 0 开始）；无规则命中时为 null"
     )

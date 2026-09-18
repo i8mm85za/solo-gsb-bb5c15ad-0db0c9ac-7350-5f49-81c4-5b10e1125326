@@ -24,6 +24,10 @@ class FlagConfig(Base):
     rules_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     # [{ "key": "red", "weight": 50, "description": "" }]
     variants_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # null 表示无生效窗口（老数据一律为 null）；否则存 JSON 文本：
+    # {"active_from": <iso utc>|null, "active_until": <iso utc>|null,
+    #  "inactive_variant_key": "off"}
+    activation_window_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -49,6 +53,8 @@ class FlagConfigVersion(Base):
     description: Mapped[str] = mapped_column(String(512), default="")
     rules_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     variants_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # 与创建该版本时的当前配置一致；老数据为 null（视为无窗口）
+    activation_window_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 

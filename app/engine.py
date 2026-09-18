@@ -1,6 +1,9 @@
 """功能开关判定引擎。
 
 判定顺序：
+0. 配置带生效窗口（activation_window）且当前时刻落在窗口
+   ``[active_from, active_until)`` 之外时，跳过 override、规则与分桶，
+   直接返回兜底变体 inactive_variant_key，decision_path="inactive"。
 1. 未指定 config_version 时，先查该 flag+user 是否存在“未过期且变体仍存在于
    当前配置”的临时强制变体（override）：命中则跳过规则与分桶，直接返回该变体，
    decision_path="override"。到期或变体已移除的记录不生效，继续正常判定。
@@ -14,6 +17,7 @@
 
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 # 桶空间固定为 100，与“权重总和必须为 100”对应
@@ -43,6 +47,19 @@ class Override:
     variant_key: str
     reason: str
     expires_at: Any = None  # naive UTC datetime 或 None（不过期）
+
+
+@dataclass(frozen=True)
+class ActivationWindow:
+    """配置的版本化生效窗口（时间均为带时区的 UTC，至少一个边界非空）。
+
+    生效区间为 ``[active_from, active_until)``：起点含、终点不含；
+    缺省的一侧表示该方向不设限。
+    """
+
+    inactive_variant_key: str
+    active_from: datetime | None = None
+    active_until: datetime | None = None
 
 
 class RuleEvaluationError(ValueError):
@@ -125,7 +142,7 @@ def pick_variant_by_weight(variants: list[Variant], bucket: int) -> tuple[str, t
 @dataclass
 class Decision:
     variant_key: str
-    decision_path: str  # "rule" | "bucket" | "override"
+    decision_path: str  # "rule" | "bucket" | "override" | "inactive"
     bucket_value: int | None
     matched_rule: Rule | None
     matched_rule_index: int | None  # 排序后从 0 开始
@@ -163,6 +180,67 @@ def override_decision(ov: Override) -> Decision:
     return Decision(
         variant_key=ov.variant_key,
         decision_path="override",
+        bucket_value=None,
+        matched_rule=None,
+        matched_rule_index=None,
+        explanation=explanation,
+    )
+
+
+def window_is_active(window: ActivationWindow, now: datetime) -> bool:
+    """判定 now 是否落在窗口 ``[active_from, active_until)`` 内。
+
+    起点含（now == active_from 视为生效）、终点不含（now == active_until
+    视为失效）；缺省的边界不参与判断。now 与边界均为带时区时间。
+    """
+    if window.active_from is not None and now < window.active_from:
+        return False
+    if window.active_until is not None and now >= window.active_until:
+        return False
+    return True
+
+
+def inactive_decision(window: ActivationWindow, now: datetime) -> Decision:
+    """窗口外判定：跳过 override、规则与分桶，返回兜底变体及边界说明。
+
+    进入本函数时窗口一定未生效（由 window_is_active 判定）；解释链指明
+    触发的是哪一侧边界（active_from 尚未到达 / active_until 已经越过）。
+    """
+    if window.active_from is not None and now < window.active_from:
+        boundary = "active_from"
+        boundary_reason = (
+            f"当前时刻 {now.isoformat()} 早于生效起点 "
+            f"{window.active_from.isoformat()}，窗口尚未生效"
+        )
+    else:
+        boundary = "active_until"
+        boundary_reason = (
+            f"当前时刻 {now.isoformat()} 不早于生效终点 "
+            f"{window.active_until.isoformat()}，窗口已结束"
+        )
+    window_detail = {
+        "active_from": window.active_from.isoformat() if window.active_from else None,
+        "active_until": window.active_until.isoformat() if window.active_until else None,
+        "inactive_variant_key": window.inactive_variant_key,
+    }
+    explanation = [
+        {
+            "step": "activation_window_loaded",
+            "detail": {**window_detail, "now": now.isoformat()},
+        },
+        {
+            "step": "activation_window_inactive",
+            "detail": {
+                **window_detail,
+                "boundary": boundary,
+                "reason": boundary_reason,
+                "selection_reason": "窗口外跳过 override、规则判定与哈希分桶，返回兜底变体",
+            },
+        },
+    ]
+    return Decision(
+        variant_key=window.inactive_variant_key,
+        decision_path="inactive",
         bucket_value=None,
         matched_rule=None,
         matched_rule_index=None,

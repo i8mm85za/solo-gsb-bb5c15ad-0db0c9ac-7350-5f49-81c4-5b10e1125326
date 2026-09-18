@@ -47,6 +47,7 @@ from app.schemas import (
     PreviewImpactRequest,
     PreviewImpactResponse,
     PreviewOutcome,
+    PreviewUser,
     RollbackRequest,
 )
 
@@ -56,10 +57,12 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     db = next(get_db())
     try:
-        crud.backfill_missing_versions(db)
-        # 老库 create_all 不会追加新列 / 新索引，显式幂等补齐
+        # 老库 create_all 不会追加新列 / 新索引，显式幂等补齐；
+        # 列补齐必须先于任何 ORM 查询（否则老库缺列时 SELECT 直接报错）
+        crud.ensure_activation_window_columns(db)
         crud.ensure_snapshot_decision_path(db)
         crud.ensure_decision_audit_indexes(db)
+        crud.backfill_missing_versions(db)
     finally:
         db.close()
     _seed_demo_flags()
@@ -342,6 +345,7 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
     # 解析本次判定使用的配置版本：缺省用最新版，指定时必须存在
     if req.config_version is None:
         rules_json, variants_json = flag.rules_json, flag.variants_json
+        window_json = flag.activation_window_json
         config_version = flag.version
     else:
         ver = crud.get_flag_version(db, flag_key, req.config_version)
@@ -351,15 +355,24 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
                 detail=f"开关 {flag_key!r} 没有版本 {req.config_version}",
             )
         rules_json, variants_json = ver.rules_json, ver.variants_json
+        window_json = ver.activation_window_json
         config_version = ver.version
 
     rules = crud.parse_rules(rules_json)
     variants = crud.parse_variants(variants_json)
 
+    # 生效窗口按所选配置版本的 [active_from, active_until) 判定：
+    # 窗口外跳过 override、规则与分桶，直接返回兜底变体（decision_path="inactive"）。
+    decision = None
+    window = crud.parse_activation_window(window_json)
+    if window is not None:
+        now = datetime.now(timezone.utc)
+        if not eng.window_is_active(window, now):
+            decision = eng.inactive_decision(window, now)
+
     # 仅在未钉住历史版本时允许临时强制变体：未过期且变体仍存在于当前配置才生效；
     # 到期或变体已移除的记录不参与，继续走规则与分桶。
-    decision = None
-    if req.config_version is None:
+    if decision is None and req.config_version is None:
         active_override = crud.get_active_override(
             db, flag_key, req.user_id, {v.key for v in variants}
         )
@@ -418,8 +431,9 @@ def preview_impact(
 ) -> PreviewImpactResponse:
     """发布前评估候选配置：当前版本与候选配置分别做只读判定并对比。
 
-    - 候选 variants/rules 沿用创建接口的全部校验（Pydantic 层返回 422）；
+    - 候选 variants/rules/activation_window 沿用创建接口的全部校验（Pydantic 层返回 422）；
     - 不写入配置版本，也不写入 DecisionSnapshot；
+    - 两侧判定都应用各自配置的生效窗口（同一请求共用同一判定时刻）；
     - 仅返回 variant_key / decision_path / matched_rule_index 任一发生变化的用户，
       顺序与请求一致；汇总输入数、变化数及当前变体 -> 候选变体的迁移计数。
     """
@@ -431,6 +445,7 @@ def preview_impact(
 
     current_rules = crud.parse_rules(flag.rules_json)
     current_variants = crud.parse_variants(flag.variants_json)
+    current_window = crud.parse_activation_window(flag.activation_window_json)
 
     # 候选配置仅存在于请求内存中；RuleIn/VariantIn 与创建接口同结构、同校验
     candidate_rules = [
@@ -438,15 +453,32 @@ def preview_impact(
         for r in sorted(req.rules, key=lambda x: x.priority)
     ]
     candidate_variants = [eng.Variant(**v.model_dump()) for v in req.variants]
+    candidate_window = (
+        eng.ActivationWindow(
+            inactive_variant_key=req.activation_window.inactive_variant_key,
+            active_from=req.activation_window.active_from,
+            active_until=req.activation_window.active_until,
+        )
+        if req.activation_window is not None
+        else None
+    )
+
+    # 整个请求使用同一时刻判定窗口，保证各用户结果可比
+    now = datetime.now(timezone.utc)
+
+    def _decide_with_window(variants, rules, window, user: PreviewUser) -> eng.Decision:
+        if window is not None and not eng.window_is_active(window, now):
+            return eng.inactive_decision(window, now)
+        return decide(flag_key, user.user_id, user.context, variants, rules)
 
     changes: list[PreviewChange] = []
     migration: dict[str, dict[str, int]] = {}
     for user in req.users:
-        current_decision = decide(
-            flag_key, user.user_id, user.context, current_variants, current_rules
+        current_decision = _decide_with_window(
+            current_variants, current_rules, current_window, user
         )
-        candidate_decision = decide(
-            flag_key, user.user_id, user.context, candidate_variants, candidate_rules
+        candidate_decision = _decide_with_window(
+            candidate_variants, candidate_rules, candidate_window, user
         )
 
         current_outcome = PreviewOutcome(
